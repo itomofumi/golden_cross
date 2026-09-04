@@ -5,7 +5,10 @@ use clap::{CommandFactory, Parser};
 /// 同時に投げるリクエスト数の上限。
 ///
 /// 増やしすぎると Yahoo からレート制限を受ける。
-pub const MAX_CONCURRENCY: usize = 16;
+pub const MAX_CONCURRENCY: usize = 8;
+
+/// 同時に投げるリクエスト数の既定値。
+pub const DEFAULT_CONCURRENCY: usize = 4;
 
 #[derive(Parser)]
 #[command(
@@ -46,7 +49,7 @@ pub struct Args {
     pub within: usize,
 
     /// 同時に取得する銘柄数
-    #[arg(short, long, default_value_t = 8)]
+    #[arg(short, long, default_value_t = DEFAULT_CONCURRENCY)]
     pub concurrency: usize,
 
     /// 走査する銘柄コード（省略時は同梱の主要銘柄リスト）
