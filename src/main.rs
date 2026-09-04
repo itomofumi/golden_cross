@@ -23,6 +23,7 @@ use cli::Args;
 use output::Row;
 use stock::Stock;
 use universe::Entry;
+use yahoo::FetchError;
 
 /// 取得する期間。75日移動平均に必要な件数を十分に上回る長さを取る。
 const RANGE: &str = "1y";
@@ -58,11 +59,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut errors: Vec<String> = Vec::new();
     let total = entries.len();
     let mut done = 0;
+    let mut succeeded = 0;
+    // レート制限を受けたら Some になり、以降のチャンクは取得しない
+    let mut rate_limited: Option<Option<u64>> = None;
 
     for chunk in entries.chunks(args.concurrency) {
         for (entry, result) in chunk.iter().zip(fetch_chunk(&client, chunk, &cache)) {
             match result {
                 Ok(stock) => {
+                    succeeded += 1;
+
                     // クロスが「直近 within 営業日以内」の銘柄だけ残す。
                     // days_ago が 0 なら最新日のクロス。
                     if let Some(cross) = cross::find_latest(&stock)
@@ -71,15 +77,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         rows.push(Row { stock, cross });
                     }
                 }
-                // 同梱リストの名称があれば添える（どの銘柄か分かりやすくするため）
-                Err(e) => errors.push(match entry.name.is_empty() {
-                    true => format!("{}: {e}", sanitize::for_display(&entry.symbol)),
-                    false => format!(
-                        "{} {}: {e}",
-                        sanitize::for_display(&entry.symbol),
-                        sanitize::escape(&entry.name)
-                    ),
-                }),
+                // レート制限は個別の失敗として数えず、全体の中断理由として扱う
+                Err(FetchError::RateLimited { retry_after }) => {
+                    rate_limited = Some(retry_after);
+                }
+                Err(e) => errors.push(describe_error(entry, &e)),
             }
         }
 
@@ -88,14 +90,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         if show_progress {
             eprint!("\r取得中 {done}/{total}");
         }
+
+        // 弾かれると分かっているリクエストを投げ続けない。
+        // 同じチャンク内のスレッドは既に走っているため、区切りは chunk 単位。
+        if rate_limited.is_some() {
+            break;
+        }
     }
     if show_progress {
         eprintln!();
     }
 
+    if let Some(retry_after) = rate_limited {
+        report_rate_limit(done, total, retry_after);
+    }
+
     // 1件も取得できなかったのは設定や通信の問題とみなす
-    if errors.len() == total {
-        return Err(format!("{total}銘柄すべての取得に失敗しました").into());
+    if succeeded == 0 {
+        return Err(format!("{done}銘柄すべての取得に失敗しました").into());
     }
 
     // 出来高の多い順に並べ、上位だけ残す
@@ -103,9 +115,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let hits = rows.len();
     rows.truncate(args.top);
 
-    report_cache(&cache, total);
+    report_cache(&cache, succeeded);
 
-    output::print_header(args.within, total - errors.len(), hits);
+    output::print_header(args.within, succeeded, hits);
 
     if rows.is_empty() {
         output::print_empty(args.within);
@@ -114,6 +126,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     report_errors(&errors, args.show_errors);
+
+    // 中断した回は結果が不完全なので、正常終了と区別できるようにする
+    if rate_limited.is_some() {
+        std::process::exit(1);
+    }
 
     Ok(())
 }
@@ -135,30 +152,56 @@ fn target_entries(args: &Args) -> Vec<Entry> {
 
 /// 複数銘柄を並列に取得する。戻り値は引数と同じ順番に並ぶ。
 ///
-/// yahoo::fetch のエラー型 Box<dyn Error> は Send ではなく、
-/// そのままではスレッド境界を越えられない。文字列に変換して返す。
-fn fetch_chunk(client: &Client, entries: &[Entry], cache: &Cache) -> Vec<Result<Stock, String>> {
+/// FetchError は Send なのでそのままスレッド境界を越えられる。
+fn fetch_chunk(
+    client: &Client,
+    entries: &[Entry],
+    cache: &Cache,
+) -> Vec<Result<Stock, FetchError>> {
     thread::scope(|scope| {
         let handles: Vec<_> = entries
             .iter()
             .map(|entry| {
                 // scope 内のスレッドは呼び出し元の変数を借用できる。
                 // スコープを抜けるまでに必ず join されるため 'static は要らない。
-                scope.spawn(move || {
-                    yahoo::fetch(client, &entry.symbol, RANGE, cache).map_err(|e| e.to_string())
-                })
+                scope.spawn(move || yahoo::fetch(client, &entry.symbol, RANGE, cache))
             })
             .collect();
 
         handles
             .into_iter()
             .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|_| Err("取得スレッドが異常終了しました".to_string()))
+                handle.join().unwrap_or_else(|_| {
+                    Err(FetchError::Other(
+                        "取得スレッドが異常終了しました".to_string(),
+                    ))
+                })
             })
             .collect()
     })
+}
+
+/// 取得に失敗した銘柄を、同梱リストの名称を添えて説明する
+fn describe_error(entry: &Entry, error: &FetchError) -> String {
+    let symbol = sanitize::for_display(&entry.symbol);
+
+    if entry.name.is_empty() {
+        format!("{symbol}: {error}")
+    } else {
+        format!("{symbol} {}: {error}", sanitize::escape(&entry.name))
+    }
+}
+
+/// レート制限による中断を標準エラー出力へ報告する
+fn report_rate_limit(done: usize, total: usize, retry_after: Option<u64>) {
+    eprintln!("レート制限を受けたため取得を中断しました（{done}/{total}銘柄）");
+
+    match retry_after {
+        Some(seconds) => eprintln!("{seconds}秒ほど待ってから再実行してください"),
+        None => eprintln!("しばらく待ってから再実行してください"),
+    }
+
+    eprintln!("取得済みの分はキャッシュに残るため、再実行時は続きから取得します");
 }
 
 /// キャッシュの利用状況を標準エラー出力へ報告する
