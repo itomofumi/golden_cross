@@ -39,6 +39,7 @@ Usage: golden_cross [OPTIONS]
 | `-c`, `--concurrency <N>` | 同時に取得する銘柄数（1〜16） | `8` |
 | `-s`, `--symbols <...>` | 走査する銘柄コード（省略時は同梱リスト） | — |
 | `--show-errors` | 取得に失敗した銘柄を一覧表示する | — |
+| `--no-cache` | キャッシュを使わず必ず取得し直す | — |
 
 ```bash
 golden_cross                          # 直近5営業日のクロスを出来高上位10件
@@ -61,6 +62,19 @@ golden_cross --symbols 7203.T 6758.T  # 対象を指定して調べる
 golden_cross > result.txt
 ```
 
+## キャッシュ
+
+取得したレスポンスを `~/.cache/golden_cross/` に保存し、**同じ日のうちは再利用**します（`XDG_CACHE_HOME` があればそちらの下）。日足データは1日1回しか変わらないためです。
+
+```
+1回目: 7.9秒（239リクエスト）
+2回目: 0.0秒（0リクエスト）
+```
+
+**注意: 株価と出来高はキャッシュ取得時点の値になります。** 終値と移動平均、クロス判定は日中に変わりませんが、現在値と出来高はザラ場中も動きます。最新の値が必要なときは `--no-cache` を付けてください。
+
+キャッシュの読み書きに失敗しても処理は止めません。壊れたファイルは読み飛ばして取得し直します。不要になったら `rm -rf ~/.cache/golden_cross` で削除できます（約4MB）。
+
 ## 判定方法
 
 前日に「25日線 ≦ 75日線」だったものが、当日「25日線 > 75日線」になった日をゴールデンクロスとみなします。複数回クロスしている場合は**最も新しいもの**を採用し、それが `--within` 営業日以内なら対象とします。
@@ -80,7 +94,7 @@ Yahoo Finance には日本株の出来高ランキングを返すエンドポイ
 ## 開発
 
 ```bash
-cargo test                    # テスト（24件）
+cargo test                    # テスト（28件）
 cargo fmt                     # 整形
 cargo clippy --all-targets    # 静的解析
 ```
@@ -95,6 +109,7 @@ src/
 ├── main.rs         エントリポイント（引数 → 並列取得 → 絞り込み → 表示）
 ├── cli.rs          コマンドライン引数の定義（clap）
 ├── universe.rs     銘柄一覧の読み込み
+├── cache.rs        取得結果のディスクキャッシュ
 ├── stock.rs        株価の型と移動平均の計算
 ├── cross.rs        ゴールデンクロスの判定
 ├── sanitize.rs     端末へ出力する文字列の無害化
@@ -115,7 +130,8 @@ src/
 | [clap](https://crates.io/crates/clap) | コマンドライン引数のパースと検証 |
 | [reqwest](https://crates.io/crates/reqwest) | HTTP クライアント（blocking + rustls） |
 | [serde](https://crates.io/crates/serde) | JSON のデシリアライズ |
-| [chrono](https://crates.io/crates/chrono) | UNIX 秒から JST への変換 |
+| [chrono](https://crates.io/crates/chrono) | UNIX 秒から JST への変換、キャッシュの日付判定 |
+| [serde_json](https://crates.io/crates/serde_json) | キャッシュした本文の解釈 |
 
 ## 注意
 

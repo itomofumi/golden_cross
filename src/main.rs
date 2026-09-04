@@ -3,6 +3,7 @@
 //! 実際の処理は各モジュールに任せ、ここでは
 //! 「引数を読む → 並列取得 → クロスを絞り込む → 出来高順に表示」だけを行う。
 
+mod cache;
 mod cli;
 mod cross;
 mod output;
@@ -17,6 +18,7 @@ use std::io::IsTerminal;
 use std::thread;
 use std::time::Duration;
 
+use cache::Cache;
 use cli::Args;
 use output::Row;
 use stock::Stock;
@@ -50,13 +52,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 進捗表示は端末のときだけ。リダイレクト先に \r が混ざるのを避ける
     let show_progress = std::io::stderr().is_terminal();
 
+    let cache = Cache::new(!args.no_cache);
+
     let mut rows: Vec<Row> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let total = entries.len();
     let mut done = 0;
 
     for chunk in entries.chunks(args.concurrency) {
-        for (entry, result) in chunk.iter().zip(fetch_chunk(&client, chunk)) {
+        for (entry, result) in chunk.iter().zip(fetch_chunk(&client, chunk, &cache)) {
             match result {
                 Ok(stock) => {
                     // クロスが「直近 within 営業日以内」の銘柄だけ残す。
@@ -99,6 +103,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let hits = rows.len();
     rows.truncate(args.top);
 
+    report_cache(&cache, total);
+
     output::print_header(args.within, total - errors.len(), hits);
 
     if rows.is_empty() {
@@ -131,7 +137,7 @@ fn target_entries(args: &Args) -> Vec<Entry> {
 ///
 /// yahoo::fetch のエラー型 Box<dyn Error> は Send ではなく、
 /// そのままではスレッド境界を越えられない。文字列に変換して返す。
-fn fetch_chunk(client: &Client, entries: &[Entry]) -> Vec<Result<Stock, String>> {
+fn fetch_chunk(client: &Client, entries: &[Entry], cache: &Cache) -> Vec<Result<Stock, String>> {
     thread::scope(|scope| {
         let handles: Vec<_> = entries
             .iter()
@@ -139,7 +145,7 @@ fn fetch_chunk(client: &Client, entries: &[Entry]) -> Vec<Result<Stock, String>>
                 // scope 内のスレッドは呼び出し元の変数を借用できる。
                 // スコープを抜けるまでに必ず join されるため 'static は要らない。
                 scope.spawn(move || {
-                    yahoo::fetch(client, &entry.symbol, RANGE).map_err(|e| e.to_string())
+                    yahoo::fetch(client, &entry.symbol, RANGE, cache).map_err(|e| e.to_string())
                 })
             })
             .collect();
@@ -153,6 +159,21 @@ fn fetch_chunk(client: &Client, entries: &[Entry]) -> Vec<Result<Stock, String>>
             })
             .collect()
     })
+}
+
+/// キャッシュの利用状況を標準エラー出力へ報告する
+fn report_cache(cache: &Cache, total: usize) {
+    if cache.is_disabled() {
+        return;
+    }
+
+    let hits = cache.hits();
+    if hits > 0 {
+        eprintln!("キャッシュ利用 {hits}件 / 取得 {}件", total - hits);
+        // 終値と移動平均は日中に変わらないが、株価と出来高は変わる。
+        // キャッシュを使った回はその時点の値になる。
+        eprintln!("※ 株価と出来高はキャッシュ取得時点の値です（--no-cache で取得し直せます）");
+    }
 }
 
 /// 取得に失敗した銘柄を標準エラー出力へ報告する

@@ -10,6 +10,7 @@ use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use std::error::Error;
 
+use crate::cache::Cache;
 use crate::sanitize;
 use crate::stock::{DailyClose, Stock};
 use model::ChartResponse;
@@ -19,10 +20,34 @@ const ENDPOINT: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 /// 銘柄コードの長さの上限。
 const MAX_SYMBOL_LEN: usize = 20;
 
-/// 指定した銘柄・期間の株価を取得する
-pub fn fetch(client: &Client, symbol: &str, range: &str) -> Result<Stock, Box<dyn Error>> {
+/// 指定した銘柄・期間の株価を取得する。
+///
+/// 同じ日にすでに取得していればキャッシュを使い、通信しない。
+pub fn fetch(
+    client: &Client,
+    symbol: &str,
+    range: &str,
+    cache: &Cache,
+) -> Result<Stock, Box<dyn Error>> {
     validate_symbol(symbol)?;
 
+    // 壊れたキャッシュは読み飛ばして取得し直す
+    if let Some(cached) = cache.read(symbol, range)
+        && let Ok(stock) = parse(&cached, symbol)
+    {
+        return Ok(stock);
+    }
+
+    let body = request(client, symbol, range)?;
+    let stock = parse(&body, symbol)?;
+
+    cache.write(symbol, range, &body);
+
+    Ok(stock)
+}
+
+/// API を呼び、レスポンス本文を文字列で返す
+fn request(client: &Client, symbol: &str, range: &str) -> Result<String, Box<dyn Error>> {
     // クエリは query() に組み立てさせる。文字列連結だと、値に含まれる
     // & や = がそのまま構造として解釈されてしまうため。
     let response = client
@@ -41,7 +66,12 @@ pub fn fetch(client: &Client, symbol: &str, range: &str) -> Result<Stock, Box<dy
         .into());
     }
 
-    let body: ChartResponse = response.error_for_status()?.json()?;
+    Ok(response.error_for_status()?.text()?)
+}
+
+/// レスポンス本文を Stock に変換する
+fn parse(text: &str, symbol: &str) -> Result<Stock, Box<dyn Error>> {
+    let body: ChartResponse = serde_json::from_str(text)?;
 
     let result = body.chart.result.into_iter().next().ok_or_else(|| {
         format!(

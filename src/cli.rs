@@ -22,6 +22,11 @@ pub const MAX_CONCURRENCY: usize = 16;
   ランキングを返すエンドポイントがないため、この範囲での順位となる。
   --symbols で対象を指定すればリストを差し替えられる。
 
+キャッシュ:
+  取得したレスポンスを ~/.cache/golden_cross/ に保存し、
+  同じ日のうちは再利用する（日足は1日1回しか変わらないため）。
+  --no-cache を付けると毎回取得し直す。
+
 例:
   golden_cross                        直近5営業日のクロスを出来高上位10件
   golden_cross --within 20            直近20営業日まで広げる
@@ -51,6 +56,10 @@ pub struct Args {
     /// 取得に失敗した銘柄を一覧表示する
     #[arg(long)]
     pub show_errors: bool,
+
+    /// キャッシュを使わず、必ず取得し直す
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 impl Args {
