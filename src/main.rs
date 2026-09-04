@@ -31,6 +31,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 1リクエスト全体（接続・送信・受信）の上限
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 通信したチャンクの後に挟む待ち時間。
+///
+/// 待たずに投げ続けると数十 req/s の山になる。
+/// キャッシュだけで済んだチャンクでは待たない。
+const CHUNK_INTERVAL: Duration = Duration::from_millis(300);
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse_and_validate();
 
@@ -63,8 +69,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     // レート制限を受けたら Some になり、以降のチャンクは取得しない
     let mut rate_limited: Option<Option<u64>> = None;
 
-    for chunk in entries.chunks(args.concurrency) {
-        for (entry, result) in chunk.iter().zip(fetch_chunk(&client, chunk, &cache, range)) {
+    let mut chunks = entries.chunks(args.concurrency).peekable();
+
+    while let Some(chunk) = chunks.next() {
+        // このチャンクで実際に通信したかを、キャッシュ利用数の増分から判断する
+        let hits_before = cache.hits();
+        let results = fetch_chunk(&client, chunk, &cache, range);
+        let fetched = chunk.len() - (cache.hits() - hits_before);
+
+        for (entry, result) in chunk.iter().zip(results) {
             match result {
                 Ok(stock) => {
                     succeeded += 1;
@@ -95,6 +108,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         // 同じチャンク内のスレッドは既に走っているため、区切りは chunk 単位。
         if rate_limited.is_some() {
             break;
+        }
+
+        // 通信したチャンクの後だけ間隔を空ける。
+        // 全部キャッシュで済んだ回に待つのは無駄なため。
+        if fetched > 0 && chunks.peek().is_some() {
+            thread::sleep(CHUNK_INTERVAL);
         }
     }
     if show_progress {
