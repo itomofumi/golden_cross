@@ -9,6 +9,7 @@ use chrono::{DateTime, FixedOffset, TimeZone};
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use std::error::Error;
+use std::fmt;
 
 use crate::cache::Cache;
 use crate::sanitize;
@@ -20,6 +21,47 @@ const ENDPOINT: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 /// 銘柄コードの長さの上限。
 const MAX_SYMBOL_LEN: usize = 20;
 
+/// 取得の失敗理由。
+///
+/// レート制限だけは呼び出し側の判断（以降の取得を打ち切る）に関わるため、
+/// 他の失敗と区別できる形にしている。
+/// スレッド間で受け渡すため Send である必要がある。
+#[derive(Debug)]
+pub enum FetchError {
+    /// レート制限（HTTP 429）。Retry-After があればその秒数
+    RateLimited { retry_after: Option<u64> },
+    /// それ以外の失敗
+    Other(String),
+}
+
+impl fmt::Display for FetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FetchError::RateLimited {
+                retry_after: Some(seconds),
+            } => {
+                write!(f, "レート制限を受けました（{seconds}秒後に再試行可能）")
+            }
+            FetchError::RateLimited { retry_after: None } => {
+                write!(f, "レート制限を受けました")
+            }
+            FetchError::Other(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl From<Box<dyn Error>> for FetchError {
+    fn from(error: Box<dyn Error>) -> Self {
+        FetchError::Other(error.to_string())
+    }
+}
+
+impl From<reqwest::Error> for FetchError {
+    fn from(error: reqwest::Error) -> Self {
+        FetchError::Other(error.to_string())
+    }
+}
+
 /// 指定した銘柄・期間の株価を取得する。
 ///
 /// 同じ日にすでに取得していればキャッシュを使い、通信しない。
@@ -28,7 +70,7 @@ pub fn fetch(
     symbol: &str,
     range: &str,
     cache: &Cache,
-) -> Result<Stock, Box<dyn Error>> {
+) -> Result<Stock, FetchError> {
     validate_symbol(symbol)?;
 
     // 壊れたキャッシュは読み飛ばして取得し直す
@@ -47,7 +89,7 @@ pub fn fetch(
 }
 
 /// API を呼び、レスポンス本文を文字列で返す
-fn request(client: &Client, symbol: &str, range: &str) -> Result<String, Box<dyn Error>> {
+fn request(client: &Client, symbol: &str, range: &str) -> Result<String, FetchError> {
     // クエリは query() に組み立てさせる。文字列連結だと、値に含まれる
     // & や = がそのまま構造として解釈されてしまうため。
     let response = client
@@ -59,25 +101,44 @@ fn request(client: &Client, symbol: &str, range: &str) -> Result<String, Box<dyn
     // error_for_status() に任せると HTTP の生エラーがそのまま出てしまうため、
     // その手前でステータスを見て分かりやすい案内に差し替える。
     if response.status() == StatusCode::NOT_FOUND {
-        return Err(format!(
+        return Err(FetchError::Other(format!(
             "銘柄コード {} が見つかりませんでした",
             sanitize::for_display(symbol)
-        )
-        .into());
+        )));
+    }
+
+    // レート制限。呼び出し側が以降の取得を打ち切れるよう、専用の値で返す
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = parse_retry_after(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+        );
+        return Err(FetchError::RateLimited { retry_after });
     }
 
     Ok(response.error_for_status()?.text()?)
 }
 
+/// Retry-After ヘッダの秒数を読む。
+///
+/// 日時形式で返ってくることもあるが、その場合は解釈せず None にする
+/// （待ち時間を案内できないだけで、中断する動きは変わらないため）。
+fn parse_retry_after(value: Option<&str>) -> Option<u64> {
+    value?.trim().parse().ok()
+}
+
 /// レスポンス本文を Stock に変換する
-fn parse(text: &str, symbol: &str) -> Result<Stock, Box<dyn Error>> {
-    let body: ChartResponse = serde_json::from_str(text)?;
+fn parse(text: &str, symbol: &str) -> Result<Stock, FetchError> {
+    let body: ChartResponse =
+        serde_json::from_str(text).map_err(|e| FetchError::Other(e.to_string()))?;
 
     let result = body.chart.result.into_iter().next().ok_or_else(|| {
-        format!(
+        FetchError::Other(format!(
             "銘柄 {} のデータが取得できませんでした",
             sanitize::for_display(symbol)
-        )
+        ))
     })?;
 
     let meta = result.meta;
@@ -86,7 +147,7 @@ fn parse(text: &str, symbol: &str) -> Result<Stock, Box<dyn Error>> {
         .quote
         .into_iter()
         .next()
-        .ok_or("価格データが取得できませんでした")?;
+        .ok_or_else(|| FetchError::Other("価格データが取得できませんでした".to_string()))?;
 
     // 日付と終値をペアにする。終値が null の日（休場など）は除外する
     let mut history = Vec::with_capacity(result.timestamp.len());
@@ -181,6 +242,33 @@ mod tests {
                 "{symbol} が通ってしまった"
             );
         }
+    }
+
+    #[test]
+    fn retry_after_の秒数を読む() {
+        use super::parse_retry_after;
+
+        assert_eq!(parse_retry_after(Some("60")), Some(60));
+        assert_eq!(parse_retry_after(Some(" 30 ")), Some(30));
+        // 日時形式は解釈しない
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn レート制限のエラーは待ち時間を含めて表示する() {
+        use super::FetchError;
+
+        let with_wait = FetchError::RateLimited {
+            retry_after: Some(60),
+        };
+        assert!(with_wait.to_string().contains("60秒"));
+
+        let without_wait = FetchError::RateLimited { retry_after: None };
+        assert!(without_wait.to_string().contains("レート制限"));
     }
 
     #[test]
