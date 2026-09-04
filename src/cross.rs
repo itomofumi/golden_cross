@@ -13,6 +13,31 @@ pub const SHORT_PERIOD: usize = 25;
 /// 長期移動平均の期間（日）
 pub const LONG_PERIOD: usize = 75;
 
+/// 取得期間の候補と、実際に返ってくる営業日数（7203.T で実測）。
+/// 短い順に並べる。
+const RANGES: [(&str, usize); 4] = [("6mo", 126), ("1y", 244), ("2y", 488), ("5y", 1223)];
+
+/// 営業日数の見積もりに持たせる余裕。
+/// 銘柄によって休場や上場時期が異なり、実際の件数は上下するため。
+const MARGIN: usize = 5;
+
+/// 判定に必要な件数を満たす、最も短い取得期間を選ぶ。
+///
+/// 必要なのは「長期線が引ける件数 + 遡る営業日数」。
+/// 固定値にすると、既定では余分に取り、長い --within では静かに検出漏れする。
+pub fn required_range(within: usize) -> &'static str {
+    let needed = LONG_PERIOD + within + MARGIN;
+
+    for (range, days) in RANGES {
+        if days >= needed {
+            return range;
+        }
+    }
+
+    // どれでも足りない場合は最長を使う（それ以上は取得できない）
+    RANGES[RANGES.len() - 1].0
+}
+
 /// 検出したゴールデンクロス
 pub struct GoldenCross {
     /// クロスが起きた日
@@ -99,6 +124,33 @@ mod tests {
         let stock = stock_with_closes(&closes);
 
         assert!(find_latest(&stock).is_none());
+    }
+
+    #[test]
+    fn 既定の遡り日数では最も短い期間を選ぶ() {
+        use super::required_range;
+
+        assert_eq!(required_range(5), "6mo");
+    }
+
+    #[test]
+    fn 遡る日数に応じて期間を広げる() {
+        use super::required_range;
+
+        // 126営業日で足りる境界（75 + within + 5 <= 126）
+        assert_eq!(required_range(46), "6mo");
+        assert_eq!(required_range(47), "1y");
+        assert_eq!(required_range(164), "1y");
+        assert_eq!(required_range(165), "2y");
+        assert_eq!(required_range(408), "2y");
+        assert_eq!(required_range(409), "5y");
+    }
+
+    #[test]
+    fn 最長を超える指定でも最長を返す() {
+        use super::required_range;
+
+        assert_eq!(required_range(100_000), "5y");
     }
 
     #[test]

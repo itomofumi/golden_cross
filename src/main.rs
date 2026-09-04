@@ -25,9 +25,6 @@ use stock::Stock;
 use universe::Entry;
 use yahoo::FetchError;
 
-/// 取得する期間。75日移動平均に必要な件数を十分に上回る長さを取る。
-const RANGE: &str = "1y";
-
 /// 接続確立までの上限
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -55,6 +52,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let cache = Cache::new(!args.no_cache);
 
+    // 取得期間は --within から決める。既定なら 6mo で足りる
+    let range = cross::required_range(args.within);
+
     let mut rows: Vec<Row> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let total = entries.len();
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut rate_limited: Option<Option<u64>> = None;
 
     for chunk in entries.chunks(args.concurrency) {
-        for (entry, result) in chunk.iter().zip(fetch_chunk(&client, chunk, &cache)) {
+        for (entry, result) in chunk.iter().zip(fetch_chunk(&client, chunk, &cache, range)) {
             match result {
                 Ok(stock) => {
                     succeeded += 1;
@@ -157,6 +157,7 @@ fn fetch_chunk(
     client: &Client,
     entries: &[Entry],
     cache: &Cache,
+    range: &str,
 ) -> Vec<Result<Stock, FetchError>> {
     thread::scope(|scope| {
         let handles: Vec<_> = entries
@@ -164,7 +165,7 @@ fn fetch_chunk(
             .map(|entry| {
                 // scope 内のスレッドは呼び出し元の変数を借用できる。
                 // スコープを抜けるまでに必ず join されるため 'static は要らない。
-                scope.spawn(move || yahoo::fetch(client, &entry.symbol, RANGE, cache))
+                scope.spawn(move || yahoo::fetch(client, &entry.symbol, range, cache))
             })
             .collect();
 
